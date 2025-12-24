@@ -1,4 +1,19 @@
-# Captive WiFi Portal Debugger - Flow Diagram
+# Captive WiFi Portal Debugger
+
+Dependency-free script for trying to diagnose and fix why you can't connect to that public hotspot.
+
+* Save [captive-wifi-tool](https://raw.githubusercontent.com/pjlsergeant/captive-wifi-tool/refs/heads/main/captive-wifi-tool) locally
+* `./captive-wifi-tool`
+
+and follow the instructions.
+
+# What it does
+
+Tries to figure out why you aren't connected to the internet. If you have DNS servers that are set to something that isn't DHCP, it'll offer to temporarily set your DNS to the DHCP server's one, fire up the portal, and then restore afterwards.
+
+Otherwise it tries to print as much helpful information from OS X as it can
+
+# What _exactly_ it does
 
 ```mermaid
 flowchart TD
@@ -106,15 +121,6 @@ flowchart TD
 | `HTTP_FAILED` | HTTP request failed - network blocked |
 | `INTERNET_WORKING` | Successfully reached test endpoint |
 
-## Portal Mode
+# Author
 
-When manual DNS or VPN is blocking portal access:
-
-1. **Backup** current DNS configuration
-2. **Set** DNS to DHCP-provided servers (what the portal expects)
-3. **Flush** DNS cache
-4. **Wait** for user to complete portal login
-5. **Restore** original DNS configuration
-6. **Clear** state file
-
-Signal handlers ensure DNS is restored even if interrupted (Ctrl+C).
+Peter Sergeant -- pete@clueball.com
