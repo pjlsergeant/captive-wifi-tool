@@ -1,0 +1,940 @@
+#!/usr/bin/env perl
+
+package CaptivePortalDebugger;
+
+use strict;
+use warnings;
+use File::Temp;
+
+sub new {
+    my ($class, %args) = @_;
+    return bless {
+        verbose              => $args{verbose} // 0,
+        original_manual_dns  => [],
+    }, $class;
+}
+
+sub verbose { $_[0]->{verbose} }
+
+sub state_file_path {
+    return "$ENV{HOME}/.captive_debug_state";
+}
+
+sub save_dns_state {
+    my ($self, $service, @original_dns) = @_;
+    my $path = $self->state_file_path();
+    open my $fh, '>', $path or return 0;
+    print $fh "service=$service\n";
+    print $fh "dns=" . (@original_dns ? join(',', @original_dns) : 'Empty') . "\n";
+    close $fh;
+    chmod 0600, $path;  # User read/write only
+    return 1;
+}
+
+sub clear_dns_state {
+    my ($self) = @_;
+    my $path = $self->state_file_path();
+    unlink $path if -e $path;
+}
+
+sub check_and_restore_stale_state {
+    my ($self) = @_;
+    my $path = $self->state_file_path();
+    return unless -e $path;
+
+    # Parse state file
+    open my $fh, '<', $path or return;
+    my %state;
+    while (<$fh>) {
+        chomp;
+        my ($k, $v) = split /=/, $_, 2;
+        $state{$k} = $v if defined $k && defined $v;
+    }
+    close $fh;
+
+    return unless $state{service} && $state{dns};
+
+    # Bold warning
+    print "\n";
+    print "!" x 60 . "\n";
+    print "!  WARNING: Previous run exited without restoring DNS!     !\n";
+    print "!" x 60 . "\n";
+    print "\n";
+    print "Service: $state{service}\n";
+    print "Original DNS: $state{dns}\n";
+    print "\n";
+    print "Restore original DNS settings? [Y/n] ";
+
+    my $answer = <STDIN>;
+    chomp $answer if defined $answer;
+
+    if (!defined $answer || $answer eq '' || $answer =~ /^[Yy]/) {
+        my @dns = $state{dns} eq 'Empty' ? ('Empty') : split(/,/, $state{dns});
+        my $result = $self->run_cmd(['sudo', 'networksetup', '-setdnsservers', $state{service}, @dns]);
+        if ($result->{success}) {
+            print "DNS restored successfully.\n";
+            $self->clear_dns_state();
+        } else {
+            print "Failed to restore DNS. You may need to fix manually:\n";
+            print "  sudo networksetup -setdnsservers \"$state{service}\" " . join(' ', @dns) . "\n";
+        }
+    } else {
+        print "Skipping restore. State file kept for next run.\n";
+    }
+    print "\n";
+}
+
+sub validate_sudo {
+    my ($self) = @_;
+
+    # Check if we already have cached sudo credentials
+    my $check = $self->run_cmd(['sudo', '-n', 'true']);
+    return 1 if $check->{success};
+
+    # Need to prompt - explain why first
+    print "\n";
+    print "Administrator privileges are needed to read network configuration.\n";
+    print "We won't change anything without asking you first.\n";
+    print "\n";
+
+    my $result = $self->run_cmd(['sudo', '-v']);
+    return $result->{success};
+}
+
+# Run a command, capture output (stdout+stderr), check status.
+# Always pass an array ref to bypass the shell (safe for untrusted input).
+sub run_cmd {
+    my ($self, $cmd) = @_;
+
+    my $cmd_str = join(' ', map { /[\s'"\\]/ ? qq{"$_"} : $_ } @$cmd);
+    print "    CMD:  $cmd_str\n" if $self->verbose;
+
+    my $pid = open(my $fh, '-|');
+    if (!defined $pid) {
+        return {
+            success   => 0,
+            exit_code => -1,
+            output    => '',
+            error     => "failed to fork: $!",
+        };
+    }
+
+    if ($pid == 0) {
+        # Child: redirect stderr to stdout, then exec
+        open(STDERR, '>&', STDOUT) or die "Can't dup stdout: $!";
+        exec(@$cmd) or die "Can't exec $cmd->[0]: $!";
+    }
+
+    # Parent: read all output and wait for child
+    my $output = do { local $/; <$fh> };
+    close($fh);
+
+    my $exit_code = $? >> 8;
+    my $signal = $? & 127;
+
+    if ($signal) {
+        return {
+            success   => 0,
+            exit_code => -1,
+            signal    => $signal,
+            output    => $output,
+            error     => "killed by signal $signal",
+        };
+    }
+
+    return {
+        success   => ($exit_code == 0),
+        exit_code => $exit_code,
+        output    => $output,
+    };
+}
+
+sub is_valid_ipv4 {
+    my ($self, $ip) = @_;
+    return 0 unless defined $ip;
+    return $ip =~ /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+}
+
+sub find_default_route {
+    my ($self) = @_;
+    my $result = $self->run_cmd(['route', '-n', 'get', 'default']);
+    return unless $result->{success};
+    my ($gw) = $result->{output} =~ /gateway:\s*(\S+)/;
+    return unless $self->is_valid_ipv4($gw);
+    my ($iface) = $result->{output} =~ /interface:\s*(\S+)/;
+    return ($gw, $iface);
+}
+
+sub get_dhcp_lease {
+    my ($self, $iface) = @_;
+    my $result = $self->run_cmd(['ifconfig', $iface]);
+    return unless $result->{success};
+    my ($ip, $mask_hex) = $result->{output} =~ /inet (\d+\.\d+\.\d+\.\d+) netmask (0x[0-9a-f]+)/;
+    return unless $self->is_valid_ipv4($ip);
+    return ($ip, $mask_hex);
+}
+
+# Get DHCP-provided DNS by reading the actual DHCP lease packet.
+sub get_dhcp_dns {
+    my ($self, $iface) = @_;
+    my $result = $self->run_cmd(['sudo', 'ipconfig', 'getpacket', $iface]);
+    return () unless $result->{success};
+    my ($dns_list) = $result->{output} =~ /domain_name_server.*?{([^}]+)}/;
+    return () unless $dns_list;
+    # Split and strip whitespace from each entry
+    return map { s/^\s+//; s/\s+$//; $_ } split /,/, $dns_list;
+}
+
+sub portal_domains {
+    return (
+        'captive.apple.com',
+        'connectivitycheck.gstatic.com',
+        'detectportal.firefox.com',
+    );
+}
+
+# Each probe domain has a distinct success signal
+sub portal_success_check {
+    my ($self, $domain, $http) = @_;
+    my $code = $http->{http_code} // 0;
+    my $body = $http->{body} // '';
+
+    if ($domain eq 'captive.apple.com') {
+        # Apple returns "Success" in the body
+        return $body =~ /Success/;
+    }
+    elsif ($domain eq 'connectivitycheck.gstatic.com') {
+        # Google returns HTTP 204 with empty body
+        return $code == 204;
+    }
+    elsif ($domain eq 'detectportal.firefox.com') {
+        # Firefox returns lowercase "success"
+        return $body =~ /success/i;
+    }
+    return 0;
+}
+
+sub test_dns_resolution {
+    my ($self, $server, $domain) = @_;
+    $domain //= 'captive.apple.com';
+    # Short timeout because blocked DNS usually drops packets silently
+    # Force IPv4 (-4, A record) since our HTTP tests and netmask logic assume IPv4
+    my $result = $self->run_cmd(['dig', '-4', "\@$server", $domain, 'A', '+short', '+time=1', '+tries=1']);
+    # dig returns 0 even on NXDOMAIN/timeout, so just check for IPs in output
+    my @ips = grep { $self->is_valid_ipv4($_) } ($result->{output} // '') =~ /(\d+\.\d+\.\d+\.\d+)/g;
+    return @ips ? \@ips : undef;
+}
+
+sub curl_error_message {
+    my ($self, $exit_code) = @_;
+    my %errors = (
+        6  => 'DNS resolution failed',
+        7  => 'Connection refused',
+        28 => 'Connection timed out',
+        35 => 'TLS/SSL error',
+        52 => 'Empty response from server',
+        56 => 'Network receive error',
+    );
+    return $errors{$exit_code} // "Curl error $exit_code";
+}
+
+sub test_http_portal {
+    my ($self, $ip, $domain) = @_;
+    $domain //= 'captive.apple.com';
+    my $ua = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15';
+
+    # Capture HTTP code and Redirect URL
+    my $result = $self->run_cmd([
+        'curl', '-s',
+        '-A', $ua,
+        '-w', "\nCODE:%{http_code}\nREDIRECT:%{redirect_url}",
+        '--connect-timeout', '2',
+        '--max-time', '4',
+        '--resolve', "$domain:80:$ip",
+        "http://$domain"
+    ]);
+
+    my $out = $result->{output} // '';
+    my ($redirect) = $out =~ /REDIRECT:(.*)$/m;
+    my ($http_code) = $out =~ /CODE:(\d+)/m;
+
+    $out =~ s/CODE:\d+\s*//;
+    $out =~ s/REDIRECT:.*$//;
+
+    return {
+        exit_code     => $result->{exit_code},
+        exit_message  => $self->curl_error_message($result->{exit_code}),
+        http_code     => $http_code,
+        redirect      => $redirect // '',
+        body          => $out,
+    };
+}
+
+sub get_dns_servers {
+    my ($self) = @_;
+    my $result = $self->run_cmd(['scutil', '--dns']);
+    return () unless $result->{success};
+    # Preserve order, dedupe keeping first occurrence
+    my (@dns, %seen);
+    while ($result->{output} =~ /^\s*nameserver\[\d+\]\s*:\s*(\S+)/mg) {
+        push @dns, $1 unless $seen{$1}++;
+    }
+    return @dns;
+}
+
+sub is_self_assigned_ip {
+    my ($self, $ip) = @_;
+    return $ip =~ /^169\.254\./;
+}
+
+sub extract_redirect_url {
+    my ($self, $body) = @_;
+    # JavaScript redirects
+    if ($body =~ /window\.location(?:\.href)?\s*=\s*["']([^"']+)["']/i) {
+        return $1;
+    }
+    # Meta refresh
+    if ($body =~ /<meta[^>]+http-equiv=["']?refresh["']?[^>]+url=([^"'\s>]+)/i) {
+        return $1;
+    }
+    return;
+}
+
+sub extract_hostname {
+    my ($self, $url) = @_;
+    if ($url =~ m{^https?://([^/:]+)}) {
+        return $1;
+    }
+    return;
+}
+
+sub test_portal_host_resolution {
+    my ($self, $redirect_url, $dns_to_test, $results_by_dns) = @_;
+
+    my $redirect_host = $self->extract_hostname($redirect_url);
+    return unless $redirect_host;
+
+    print "    Testing DNS for portal host: $redirect_host\n";
+    for my $dns_test (@$dns_to_test) {
+        my $test_ips = $self->test_dns_resolution($dns_test->{server}, $redirect_host);
+        my $label = $dns_test->{label};
+        my $server_label = $self->label_dns($dns_test->{server});
+
+        if ($test_ips) {
+            print "      OK $label DNS ($server_label): $redirect_host -> $test_ips->[0]\n";
+            $results_by_dns->{$label}{portal_host_resolves} = 1;
+        } else {
+            print "      FAIL $label DNS ($server_label): $redirect_host FAILED TO RESOLVE\n";
+            $results_by_dns->{$label}{portal_host_resolves} = 0;
+        }
+    }
+}
+
+sub get_network_service_for_interface {
+    my ($self, $iface) = @_;
+    my $result = $self->run_cmd(['networksetup', '-listnetworkserviceorder']);
+    return unless $result->{success};
+
+    # Parse blocks like:
+    # (1) Wi-Fi
+    # (Hardware Port: Wi-Fi, Device: en0)
+    # Disabled services show as (*1) or similar
+    my $current_service;
+    for my $line (split /\n/, $result->{output}) {
+        if ($line =~ /^\(\*?\d+\)\s+(.+)$/) {
+            ($current_service = $1) =~ s/\s+$//;
+        }
+        elsif ($line =~ /Device:\s*([^)]+)\)/) {
+            return $current_service if $1 eq $iface && $current_service;
+        }
+    }
+    return;
+}
+
+sub known_dns {
+    return {
+        # IPv4
+        '100.100.100.100'      => 'Tailscale',
+        '8.8.8.8'              => 'Google',
+        '8.8.4.4'              => 'Google',
+        '1.1.1.1'              => 'Cloudflare',
+        '1.0.0.1'              => 'Cloudflare',
+        '9.9.9.9'              => 'Quad9',
+        '208.67.222.222'       => 'OpenDNS',
+        # IPv6 (lowercase compressed form)
+        '2001:4860:4860::8888' => 'Google',
+        '2001:4860:4860::8844' => 'Google',
+        '2606:4700:4700::1111' => 'Cloudflare',
+        '2606:4700:4700::1001' => 'Cloudflare',
+        '2620:fe::fe'          => 'Quad9',
+        '2620:119:35::35'      => 'OpenDNS',
+    };
+}
+
+sub label_dns {
+    my ($self, $server) = @_;
+    my $label = $self->known_dns->{lc $server};
+    return $label ? "$server ($label)" : $server;
+}
+
+sub label_dns_list {
+    my ($self, @servers) = @_;
+    return join ', ', map { $self->label_dns($_) } @servers;
+}
+
+sub check_vpn_dns {
+    my ($self, @dns_servers) = @_;
+    my $known = $self->known_dns;
+    for my $dns (@dns_servers) {
+        return $known->{$dns} if $known->{$dns};
+    }
+    return;
+}
+
+sub get_manual_dns {
+    my ($self) = @_;
+    my $service = $self->{network_service} or return ();
+    my $result = $self->run_cmd(['networksetup', '-getdnsservers', $service]);
+    return () unless $result->{success};
+    return () if $result->{output} =~ /There aren't any DNS Servers/;
+    return grep { /\S/ } split /\n/, $result->{output};
+}
+
+sub ip_to_int {
+    my ($self, $ip) = @_;
+    my @octets = split /\./, $ip;
+    return ($octets[0] << 24) | ($octets[1] << 16) | ($octets[2] << 8) | $octets[3];
+}
+
+sub is_same_network {
+    my ($self, $ip1, $ip2, $mask_hex) = @_;
+    my $mask = hex($mask_hex);
+    return ($self->ip_to_int($ip1) & $mask) == ($self->ip_to_int($ip2) & $mask);
+}
+
+sub set_dns {
+    my ($self, @servers) = @_;
+    my $service = $self->{network_service};
+    unless ($service) {
+        print "Warning: No network service detected, cannot modify DNS\n";
+        return 0;
+    }
+    my @args = ('sudo', 'networksetup', '-setdnsservers', $service);
+    push @args, @servers ? @servers : 'Empty';
+    my $result = $self->run_cmd(\@args);
+    unless ($result->{success}) {
+        print "Warning: Failed to set DNS servers\n";
+        return 0;
+    }
+    return 1;
+}
+
+sub flush_dns_cache {
+    my ($self) = @_;
+    my $r1 = $self->run_cmd(['sudo', 'dscacheutil', '-flushcache']);
+    my $r2 = $self->run_cmd(['sudo', 'killall', '-HUP', 'mDNSResponder']);
+    return $r1->{success} && $r2->{success};
+}
+
+sub restore_dns {
+    my ($self) = @_;
+    print "\n--- Restoring DNS settings... ---\n";
+    my $success = $self->set_dns(@{$self->{original_manual_dns}});
+    if ($success) {
+        my @restored = $self->get_manual_dns();
+        if (@restored) {
+            print "Restored to: " . join(', ', @restored) . "\n";
+        } else {
+            print "Restored to: (DHCP/automatic)\n";
+        }
+    } else {
+        print "WARNING: Failed to restore DNS settings!\n";
+        print "State file preserved for recovery on next run.\n";
+    }
+    return $success;
+}
+
+sub run_portal_mode {
+    my ($self, $iface, $gw) = @_;
+
+    unless ($self->{network_service}) {
+        print "\nCannot enter portal mode: network service name unknown.\n";
+        print "Please manually configure DNS using System Preferences.\n";
+        return;
+    }
+
+    print "\n" . ("=" x 50) . "\n";
+    print "       PORTAL LOGIN MODE\n";
+    print +("=" x 50) . "\n\n";
+
+    # Back up current DNS settings
+    @{$self->{original_manual_dns}} = $self->get_manual_dns();
+    if (@{$self->{original_manual_dns}}) {
+        print "Saving current DNS: " . join(', ', @{$self->{original_manual_dns}}) . "\n";
+    } else {
+        print "Current DNS:        (DHCP/automatic)\n";
+    }
+
+    # Get DHCP-provided DNS from the lease packet
+    my @dhcp_dns = $self->get_dhcp_dns($iface);
+    my @target_dns;
+
+    if (@dhcp_dns) {
+        print "DHCP DNS:           " . join(', ', @dhcp_dns) . "\n";
+        @target_dns = @dhcp_dns;
+    } else {
+        # No DHCP DNS found - could be missing from packet or command failed
+        print "DHCP DNS:           (not found in lease)\n";
+        print "Falling back to gateway ($gw) as DNS server.\n";
+        @target_dns = ($gw);
+    }
+
+    # Save state BEFORE changing DNS so we can recover from crashes
+    unless ($self->save_dns_state($self->{network_service}, @{$self->{original_manual_dns}})) {
+        print "ERROR: Cannot save recovery state to " . $self->state_file_path() . "\n";
+        print "Aborting portal mode to avoid leaving DNS in an unrecoverable state.\n";
+        return;
+    }
+
+    print "Setting DNS to: " . join(', ', @target_dns) . "\n";
+    unless ($self->set_dns(@target_dns)) {
+        print "Failed to set DNS. Aborting portal mode.\n";
+        $self->clear_dns_state();
+        return;
+    }
+
+    # Set up signal handlers now that DNS has been changed
+    my %old_handlers;
+    for my $sig (qw(INT TERM HUP QUIT)) {
+        $old_handlers{$sig} = $SIG{$sig};
+        $SIG{$sig} = sub {
+            my $restored = $self->restore_dns();
+            $self->clear_dns_state() if $restored;
+            $SIG{$_} = $old_handlers{$_} for keys %old_handlers;
+            exit;
+        };
+    }
+
+    unless ($self->flush_dns_cache()) {
+        print "Warning: DNS cache flush may have failed.\n";
+    }
+
+    sleep 2;
+
+    print "\n" . ("-" x 50) . "\n";
+    print "DNS is now pinned to network-provided servers.\n";
+    print "1. If you didn't get prompted to login, try: http://neverssl.com\n";
+    print "2. ONCE YOU ARE ONLINE, come back here and press [ENTER].\n";
+    print +("-" x 50) . "\n\n";
+
+    print "Press Enter to restore original DNS (or Ctrl+C)...\n";
+    <STDIN>;
+
+    my $restored = $self->restore_dns();
+    $self->clear_dns_state() if $restored;
+    $SIG{$_} = $old_handlers{$_} for keys %old_handlers;
+    return $restored;
+}
+
+sub run {
+    my ($self) = @_;
+
+    my ($gw, $iface) = $self->find_default_route();
+
+    if (!$iface) {
+        print "No active network connection found.\n";
+        return;
+    }
+
+    # Validate sudo upfront for accurate DHCP DNS and portal mode
+    unless ($self->validate_sudo()) {
+        print "Cannot proceed without administrator privileges.\n";
+        return;
+    }
+
+    # Check for stale state from a previous crashed run
+    $self->check_and_restore_stale_state();
+
+    # Map interface to network service name
+    my $service = $self->get_network_service_for_interface($iface);
+    if (!$service) {
+        print "Warning: Could not find network service for interface $iface\n";
+        print "DNS modification features will be unavailable.\n\n";
+    }
+    $self->{network_service} = $service;
+
+    # --- DIAGNOSTIC MODE ---
+    print "=== 1. NETWORK INTERFACE ===\n";
+    print "Interface:       $iface\n";
+    print "Network Service: " . ($service // "(unknown)") . "\n";
+    print "Default Gateway: $gw\n";
+
+    my ($ip, $netmask) = $self->get_dhcp_lease($iface);
+    if (!$ip) {
+        print "No IP address found on $iface\n";
+        return;
+    }
+    print "Local IP:        $ip\n";
+
+    if ($self->is_self_assigned_ip($ip)) {
+        print "\nCRITICAL: Self-assigned IP ($ip).\n";
+        print "   DHCP failed. You will not be able to reach the portal.\n";
+        print "   Try: sudo ipconfig set $iface DHCP\n";
+        return;
+    }
+
+    # --- DNS DISCOVERY ---
+    print "\n=== 2. DNS CONFIGURATION ===\n";
+    my @sys_dns = $self->get_dns_servers();
+    my @manual_dns = $self->get_manual_dns();
+    my @dhcp_dns = $self->get_dhcp_dns($iface);
+    my $vpn_dns = $self->check_vpn_dns(@sys_dns);
+
+    print "System DNS:      " . $self->label_dns_list(@sys_dns) . "\n";
+    print "Manual DNS:      " . (@manual_dns ? $self->label_dns_list(@manual_dns) : "(none)") . "\n";
+    print "DHCP DNS:        " . (@dhcp_dns ? $self->label_dns_list(@dhcp_dns) : "(none in lease)") . "\n";
+    print "Alt DNS in use:  " . ($vpn_dns ? "Yes ($vpn_dns)" : "No") . "\n";
+
+    # --- PORTAL TESTS ---
+    print "\n=== 3. CAPTIVE PORTAL DETECTION ===\n";
+
+    # We want to test against the DHCP DNS (the "Correct" one)
+    # AND the System DNS (the "Current" one, which might be wrong)
+    # Skip IPv6 for now - our HTTP tests assume IPv4
+    # WONTFIX: Only test first server per category. Testing all would catch
+    # edge cases where primary is blocked but fallback works, but adds complexity.
+    my @dns_to_test;
+    my %seen_dns;
+    for my $dns (@dhcp_dns) {
+        next if $dns =~ /:/;  # Skip IPv6
+        push @dns_to_test, { server => $dns, label => 'DHCP' };
+        $seen_dns{$dns} = 1;
+        last;
+    }
+    for my $dns (@sys_dns) {
+        next if $dns =~ /:/;  # Skip IPv6
+        next if $seen_dns{$dns};
+        push @dns_to_test, { server => $dns, label => 'System' };
+        last;
+    }
+
+    unless (@dns_to_test) {
+        print "No IPv4 DNS servers found to test (only IPv6 configured).\n";
+        print "Cannot perform captive portal detection.\n";
+        return;
+    }
+
+    my %results_by_dns;
+    for my $dns_entry (@dns_to_test) {
+        $results_by_dns{$dns_entry->{label}} = {
+            dns_interception  => 0,
+            http_interception => 0,
+            dns_blocked       => 0,
+            http_failed       => 0,
+            internet_working  => 0,
+            portal_url        => '',
+        };
+    }
+
+    my $dns_interception = 0;
+    my $http_interception = 0;
+    my $dns_blocked = 0;
+    my $http_failed = 0;
+    my $portal_url = "";
+    my $internet_working = 0;
+
+    for my $dns_entry (@dns_to_test) {
+        my $target_dns = $dns_entry->{server};
+        my $dns_label = $dns_entry->{label};
+
+        print "\n--- Testing via $dns_label DNS: " . $self->label_dns($target_dns) . " ---\n";
+
+        foreach my $domain ($self->portal_domains()) {
+            print "  Checking $domain...\n";
+
+            # 1. DNS Resolution
+            my $ips = $self->test_dns_resolution($target_dns, $domain);
+
+            if (!$ips) {
+                print "    DNS Resolution Failed (Timeout/Refused)\n";
+                $results_by_dns{$dns_label}{dns_blocked} = 1;
+                $dns_blocked = 1;
+                next;
+            }
+
+            my $resolved_ip = $ips->[0];
+            my $is_local_ip = $self->is_same_network($resolved_ip, $ip, $netmask);
+
+            # Heuristic: If Apple/Google resolves to a local IP, it is DNS Interception
+            if ($is_local_ip) {
+                print "    DNS INTERCEPTION: Resolved to local IP $resolved_ip\n";
+                $results_by_dns{$dns_label}{dns_interception} = 1;
+                $dns_interception = 1;
+            } else {
+                print "    Resolved to public IP $resolved_ip\n";
+            }
+
+            # 2. HTTP Request
+            my $http = $self->test_http_portal($resolved_ip, $domain);
+            my $is_success = $self->portal_success_check($domain, $http);
+
+            if ($http->{redirect}) {
+                print "    HTTP REDIRECT (3xx/Location): -> $http->{redirect}\n";
+                $results_by_dns{$dns_label}{http_interception} = 1;
+                $results_by_dns{$dns_label}{portal_url} = $http->{redirect};
+                $http_interception = 1;
+                $portal_url = $http->{redirect};
+
+                $self->test_portal_host_resolution($http->{redirect}, \@dns_to_test, \%results_by_dns);
+
+                last; # Found it
+            }
+            elsif (!$is_success && ($http->{http_code} // 0) >= 200 && ($http->{http_code} // 0) < 300) {
+                print "    HTTP INJECTION: Got $http->{http_code} but not expected success response (Portal)\n";
+                $results_by_dns{$dns_label}{http_interception} = 1;
+
+                # Dump portal page for investigation
+                my $fh = File::Temp->new(
+                    TEMPLATE => 'portal_page_XXXX',
+                    SUFFIX   => '.html',
+                    TMPDIR   => 1,
+                    UNLINK   => 0,
+                );
+                if ($fh) {
+                    print $fh $http->{body};
+                    close $fh;
+                    print "    Portal page saved to: " . $fh->filename . "\n";
+                }
+
+                # Try to extract JS/meta redirect URL
+                my $js_redirect = $self->extract_redirect_url($http->{body});
+                if ($js_redirect) {
+                    print "    JS Redirect found: $js_redirect\n";
+                    $results_by_dns{$dns_label}{portal_url} = $js_redirect;
+                    $portal_url = $js_redirect;
+
+                    $self->test_portal_host_resolution($js_redirect, \@dns_to_test, \%results_by_dns);
+                } else {
+                    # Fallback: try to grab title
+                    my ($title) = $http->{body} =~ /<title>(.*?)<\/title>/si;
+                    $results_by_dns{$dns_label}{portal_url} = "Inline Page: " . ($title // "Unknown Title");
+                    $portal_url = $results_by_dns{$dns_label}{portal_url};
+                }
+
+                $http_interception = 1;
+                last; # Found it
+            }
+            elsif ($http->{exit_code} != 0) {
+                print "    HTTP Connection Failed ($http->{exit_message})\n";
+                $results_by_dns{$dns_label}{http_failed} = 1;
+                $http_failed = 1;
+            }
+            elsif ($is_success) {
+                print "    Internet appears OPEN (Success response received)\n";
+                $results_by_dns{$dns_label}{internet_working} = 1;
+                $internet_working = 1;
+                last; # No need to check more domains
+            }
+        }
+    }
+
+    # --- SUMMARY AND REMEDIATION ---
+
+    print "\n" . ("=" x 40) . "\n";
+    print "       DIAGNOSTIC SUMMARY\n";
+    print +("=" x 40) . "\n";
+
+    # Highlight mismatch between DHCP and System DNS results
+    if (exists $results_by_dns{DHCP} && exists $results_by_dns{System}) {
+        my $dhcp_works = $results_by_dns{DHCP}{internet_working} || $results_by_dns{DHCP}{http_interception};
+        my $sys_works = $results_by_dns{System}{internet_working} || $results_by_dns{System}{http_interception};
+        my $dhcp_blocked_result = $results_by_dns{DHCP}{dns_blocked};
+        my $sys_blocked = $results_by_dns{System}{dns_blocked};
+
+        if ($dhcp_works && !$sys_works) {
+            print "\nDNS MISMATCH DETECTED:\n";
+            print "   DHCP DNS works, but your System DNS does not.\n";
+            print "   This is likely the cause of your connectivity issue.\n";
+            if ($service) {
+                print "\n   To fix, force your system to use DHCP-provided DNS:\n";
+                print "   \$ sudo networksetup -setdnsservers \"$service\" Empty  # Switch to DHCP DNS\n";
+                print "   \$ sudo dscacheutil -flushcache                        # Flush the DNS cache\n";
+                print "   \$ sudo killall -HUP mDNSResponder                     # Restart DNS resolver\n";
+            } else {
+                print "\n   Use System Preferences > Network to switch DNS to automatic.\n";
+            }
+            print "\n";
+        }
+        elsif (!$dhcp_blocked_result && $sys_blocked) {
+            print "\nDNS MISMATCH DETECTED:\n";
+            print "   DHCP DNS resolves, but your System DNS is blocked.\n";
+            print "   Your configured DNS is being firewalled by this network.\n";
+            if ($service) {
+                print "\n   To fix, force your system to use DHCP-provided DNS:\n";
+                print "   \$ sudo networksetup -setdnsservers \"$service\" Empty  # Switch to DHCP DNS\n";
+                print "   \$ sudo dscacheutil -flushcache                        # Flush the DNS cache\n";
+                print "   \$ sudo killall -HUP mDNSResponder                     # Restart DNS resolver\n";
+            } else {
+                print "\n   Use System Preferences > Network to switch DNS to automatic.\n";
+            }
+            print "\n";
+        }
+        elsif ($sys_works && $dhcp_blocked_result) {
+            print "\nDNS MISMATCH DETECTED:\n";
+            print "   System DNS works, but DHCP DNS is blocked/failing.\n";
+            print "   Network-provided DNS may be misconfigured.\n\n";
+        }
+
+        # Check if portal host resolves differently
+        my $dhcp_portal_ok = $results_by_dns{DHCP}{portal_host_resolves};
+        my $sys_portal_ok = $results_by_dns{System}{portal_host_resolves};
+        if (defined $dhcp_portal_ok && defined $sys_portal_ok) {
+            if ($dhcp_portal_ok && !$sys_portal_ok) {
+                print "\nPORTAL HOST DNS FAILURE:\n";
+                print "   The portal redirect URL resolves via DHCP DNS but NOT via your System DNS.\n";
+                print "   This is almost certainly why you cannot complete the captive portal login.\n";
+                print "   Your browser cannot reach the login page because DNS lookup fails.\n\n";
+            }
+            elsif (!$dhcp_portal_ok && $sys_portal_ok) {
+                print "\nPORTAL HOST DNS ISSUE:\n";
+                print "   The portal redirect URL resolves via System DNS but NOT via DHCP DNS.\n";
+                print "   The network's DNS may be misconfigured.\n\n";
+            }
+            elsif (!$dhcp_portal_ok && !$sys_portal_ok) {
+                print "\nPORTAL HOST UNRESOLVABLE:\n";
+                print "   The portal redirect URL does not resolve via ANY DNS server.\n";
+                print "   The captive portal itself may be misconfigured.\n\n";
+            }
+        }
+    }
+
+    if ($internet_working) {
+        print "STATUS: Connected to Internet\n\n";
+        print "Network Info:\n";
+        print "  Interface:   $iface\n";
+        print "  Local IP:    $ip\n";
+        print "  Gateway:     $gw\n";
+        print "  Manual DNS:  " . (@manual_dns ? $self->label_dns_list(@manual_dns) : "(none)") . "\n";
+        print "  DHCP DNS:    " . (@dhcp_dns ? $self->label_dns_list(@dhcp_dns) : "(none)") . "\n";
+        print "  Actual DNS:  " . $self->label_dns_list(@sys_dns) . "\n";
+        print "\n";
+        return;
+    }
+
+    # Q1: DNS or HTTP Interception?
+    if ($dns_interception) {
+        print "TYPE: DNS Interception\n";
+        print "The network is spoofing DNS records to point you to their local server ($gw).\n";
+    } elsif ($http_interception) {
+        print "TYPE: HTTP Interception\n";
+        print "DNS is real, but the gateway is intercepting HTTP traffic on port 80.\n";
+    } elsif ($dns_blocked) {
+        print "TYPE: DNS BLOCKED\n";
+        print "The network is blocking your DNS queries entirely.\n";
+    } elsif ($http_failed) {
+        print "TYPE: HTTP FAILED\n";
+        print "DNS works, but HTTP connections are failing (network may be blocking port 80).\n";
+    } else {
+        print "TYPE: Unknown / Open Internet\n";
+    }
+
+    # Q2: Are manual/VPN servers breaking it?
+    my $conflict = 0;
+    if (@manual_dns) {
+        print "\nPROBLEM: Manual DNS is Active\n";
+        print "You are forcing DNS to: " . $self->label_dns_list(@manual_dns) . "\n";
+        if ($dns_interception) {
+            print "This BREAKS the portal because you are bypassing their DNS spoofing.\n";
+            $conflict = 1;
+        } elsif ($http_interception) {
+            print "This MIGHT work if they intercept IP traffic, but often fails.\n";
+            $conflict = 1;
+        } elsif ($dns_blocked) {
+            print "This FAILS because the firewall blocks traffic to @manual_dns.\n";
+            $conflict = 1;
+        }
+    }
+
+    # Check for stale DNS config (system DNS differs from DHCP DNS, but no manual DNS set)
+    my $stale_dns = 0;
+    if (!@manual_dns && @dhcp_dns && @sys_dns) {
+        my %dhcp_set = map { $_ => 1 } @dhcp_dns;
+        my @non_dhcp = grep { !$dhcp_set{$_} } @sys_dns;
+        if (@non_dhcp) {
+            print "\nPROBLEM: Stale DNS Configuration\n";
+            print "System is using " . $self->label_dns_list(@non_dhcp) . " but DHCP provides " . $self->label_dns_list(@dhcp_dns) . "\n";
+            print "This usually means a previous manual DNS setting is cached. Renew the DHCP lease.\n";
+            $stale_dns = 1;
+            $conflict = 1;
+        }
+    }
+
+    if ($vpn_dns) {
+        print "\nPROBLEM: Alternative DNS ($vpn_dns) in use\n";
+        print "Using $vpn_dns DNS bypasses the network's DNS, which can break captive portal detection.\n";
+        $conflict = 1;
+    }
+
+    # REMEDIATION STEPS
+    if ($conflict || $dns_blocked) {
+        print "\n" . ("-" x 40) . "\n";
+        print "       SUGGESTED FIXES\n";
+        print +("-" x 40) . "\n";
+
+        my $step = 1;
+
+        if ($vpn_dns && $vpn_dns eq 'Tailscale') {
+            print "$step. DISCONNECT TAILSCALE:\n";
+            print "   Click the Tailscale menu bar icon and toggle off, or:\n";
+            print "   /Applications/Tailscale.app/Contents/MacOS/Tailscale down\n\n";
+            $step++;
+        }
+
+        if (@manual_dns && $service) {
+            print "$step. REMOVE HARD-CODED DNS:\n";
+            print "   # This reverts to use the DHCP provided servers\n";
+            print "   networksetup -setdnsservers \"$service\" Empty\n\n";
+            $step++;
+        }
+
+        print "$step. RENEW DHCP LEASE:\n";
+        print "   sudo ipconfig set $iface DHCP\n";
+
+        # Offer portal mode if manual DNS or VPN is the likely culprit (and we can modify DNS)
+        if ($service && (@manual_dns || $vpn_dns)) {
+            print "\n" . ("-" x 40) . "\n";
+            print "       QUICK FIX\n";
+            print +("-" x 40) . "\n";
+            print "This will temporarily set DNS to the network-provided servers,\n";
+            print "let you complete the captive portal login, then restore your\n";
+            print "original DNS configuration automatically.\n\n";
+            print "Enter portal mode? [y/N] ";
+
+            my $answer = <STDIN>;
+            chomp($answer) if defined $answer;
+            if (defined $answer && $answer =~ /^[Yy]/) {
+                $self->run_portal_mode($iface, $gw);
+            }
+        }
+    } elsif ($http_interception) {
+        print "\nOpening http://neverssl.com to trigger the captive portal...\n";
+        $self->run_cmd(['open', 'http://neverssl.com']);
+    }
+
+    print "\n";
+}
+
+# --- MODULINO BOILERPLATE ---
+
+sub main {
+    require Getopt::Std;
+    my %opts;
+    Getopt::Std::getopts('v', \%opts);
+
+    my $debugger = CaptivePortalDebugger->new(verbose => $opts{v});
+    $debugger->run();
+}
+
+main() unless caller();
+
+1;
