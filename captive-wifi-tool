@@ -10,6 +10,7 @@ sub new {
     my ($class, %args) = @_;
     return bless {
         verbose              => $args{verbose} // 0,
+        timeout              => $args{timeout} // 2,  # connect timeout (max-time is 2x)
         original_manual_dns  => [],
     }, $class;
 }
@@ -276,14 +277,16 @@ sub test_http_portal {
     my ($self, $ip, $domain) = @_;
     $domain //= 'captive.apple.com';
     my $ua = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15';
+    my $connect_timeout = $self->{timeout};
+    my $max_time = $connect_timeout * 2;
 
     # Capture HTTP code and Redirect URL
     my $result = $self->run_cmd([
         'curl', '-s',
         '-A', $ua,
         '-w', "\nCODE:%{http_code}\nREDIRECT:%{redirect_url}",
-        '--connect-timeout', '2',
-        '--max-time', '4',
+        '--connect-timeout', $connect_timeout,
+        '--max-time', $max_time,
         '--resolve', "$domain:80:$ip",
         "http://$domain"
     ]);
@@ -951,6 +954,7 @@ sub run {
     } elsif ($http_failed) {
         print "TYPE: HTTP FAILED\n";
         print "DNS works, but HTTP connections are failing (network may be blocking port 80).\n";
+        print "If the network is slow, try increasing the timeout: -t 10\n";
     } else {
         print "TYPE: Unknown / Open Internet\n";
     }
@@ -1046,9 +1050,25 @@ sub run {
 sub main {
     require Getopt::Std;
     my %opts;
-    Getopt::Std::getopts('v', \%opts);
+    Getopt::Std::getopts('vt:', \%opts);
 
-    my $debugger = CaptivePortalDebugger->new(verbose => $opts{v});
+    my $timeout;
+    if (defined $opts{t}) {
+        if ($opts{t} !~ /^\d+$/ || $opts{t} <= 0) {
+            print STDERR "Error: -t requires a positive integer (e.g., -t 10)\n";
+            exit 1;
+        }
+        if ($opts{t} > 300) {
+            print STDERR "Error: -t value too large (max 300 seconds)\n";
+            exit 1;
+        }
+        $timeout = $opts{t};
+    }
+
+    my $debugger = CaptivePortalDebugger->new(
+        verbose => $opts{v},
+        timeout => $timeout,
+    );
     $debugger->run();
 }
 
