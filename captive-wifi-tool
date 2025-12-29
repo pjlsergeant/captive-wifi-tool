@@ -165,6 +165,40 @@ sub find_default_route {
     return ($gw, $iface);
 }
 
+# Find active WiFi interface even when there's no default route
+# This handles captive portal networks where routing isn't set up yet
+sub find_wifi_interface {
+    my ($self) = @_;
+
+    # Get the WiFi interface name (usually en0 or en1)
+    my $result = $self->run_cmd(['networksetup', '-listallhardwareports']);
+    return unless $result->{success};
+
+    my $wifi_iface;
+    my $in_wifi_block = 0;
+    for my $line (split /\n/, $result->{output}) {
+        if ($line =~ /Hardware Port:\s*Wi-?Fi/i) {
+            $in_wifi_block = 1;
+        } elsif ($in_wifi_block && $line =~ /Device:\s*(\S+)/) {
+            $wifi_iface = $1;
+            last;
+        } elsif ($line =~ /Hardware Port:/) {
+            $in_wifi_block = 0;
+        }
+    }
+    return unless $wifi_iface;
+
+    # Check if the WiFi interface has an IP address
+    # If it does, we're connected to a network (even without a default route)
+    my $ifconfig = $self->run_cmd(['ifconfig', $wifi_iface]);
+    if ($ifconfig->{success} && $ifconfig->{output} =~ /status: active/ &&
+        $ifconfig->{output} =~ /inet (\d+\.\d+\.\d+\.\d+)/) {
+        my $ip = $1;
+        return ($wifi_iface, $ip) if $self->is_valid_ipv4($ip);
+    }
+    return;
+}
+
 sub get_dhcp_lease {
     my ($self, $iface) = @_;
     my $result = $self->run_cmd(['ifconfig', $iface]);
@@ -482,11 +516,16 @@ sub run_portal_mode {
     if (@dhcp_dns) {
         print "DHCP DNS:           " . join(', ', @dhcp_dns) . "\n";
         @target_dns = @dhcp_dns;
-    } else {
+    } elsif ($gw) {
         # No DHCP DNS found - could be missing from packet or command failed
         print "DHCP DNS:           (not found in lease)\n";
         print "Falling back to gateway ($gw) as DNS server.\n";
         @target_dns = ($gw);
+    } else {
+        print "DHCP DNS:           (not found in lease)\n";
+        print "ERROR: No DHCP DNS and no gateway available to use as fallback.\n";
+        print "Cannot enter portal mode without a DNS server to use.\n";
+        return;
     }
 
     # Save state BEFORE changing DNS so we can recover from crashes
@@ -540,10 +579,27 @@ sub run {
     my ($self) = @_;
 
     my ($gw, $iface) = $self->find_default_route();
+    my $no_default_route = 0;
+    my $cached_ip;  # IP from fallback path, to avoid redundant ifconfig call
 
     if (!$iface) {
-        print "No active network connection found.\n";
-        return;
+        # No default route - try to find WiFi interface anyway
+        # This is common on captive portal networks before authentication
+        my ($wifi_iface, $wifi_ip) = $self->find_wifi_interface();
+        if ($wifi_iface) {
+            $iface = $wifi_iface;
+            $cached_ip = $wifi_ip;
+            $no_default_route = 1;
+            print "WARNING: No default route found, but WiFi interface $iface is active.\n";
+            print "This typically means you're on a captive portal network that hasn't\n";
+            print "set up routing yet. Continuing with limited diagnostics...\n\n";
+        } else {
+            print "No active network connection found.\n";
+            print "  - No default route in routing table\n";
+            print "  - No active WiFi interface detected\n";
+            print "\nTry connecting to a WiFi network first.\n";
+            return;
+        }
     }
 
     # Validate sudo upfront for accurate DHCP DNS and portal mode
@@ -567,12 +623,18 @@ sub run {
     print "=== 1. NETWORK INTERFACE ===\n";
     print "Interface:       $iface\n";
     print "Network Service: " . ($service // "(unknown)") . "\n";
-    print "Default Gateway: $gw\n";
+    print "Default Gateway: " . ($gw // "(none - no route)") . "\n";
 
-    my ($ip, $netmask) = $self->get_dhcp_lease($iface);
-    if (!$ip) {
-        print "No IP address found on $iface\n";
-        return;
+    my ($ip, $netmask);
+    if ($cached_ip) {
+        # Use IP from fallback path (netmask not needed since we short-circuit before probes)
+        $ip = $cached_ip;
+    } else {
+        ($ip, $netmask) = $self->get_dhcp_lease($iface);
+        if (!$ip) {
+            print "No IP address found on $iface\n";
+            return;
+        }
     }
     print "Local IP:        $ip\n";
 
@@ -580,6 +642,61 @@ sub run {
         print "\nCRITICAL: Self-assigned IP ($ip).\n";
         print "   DHCP failed. You will not be able to reach the portal.\n";
         print "   Try: sudo ipconfig set $iface DHCP\n";
+        return;
+    }
+
+    # --- NO DEFAULT ROUTE CASE ---
+    # When there's no route, DNS/HTTP probes will fail for the wrong reasons.
+    # Give targeted advice instead of running misleading diagnostics.
+    if ($no_default_route) {
+        print "\n" . ("=" x 50) . "\n";
+        print "       NO DEFAULT ROUTE\n";
+        print +("=" x 50) . "\n\n";
+
+        print "Your WiFi interface ($iface) has IP $ip but no default route.\n";
+        print "This is common on captive portal networks before authentication.\n\n";
+
+        # Show DNS info - might be useful
+        my @dhcp_dns = $self->get_dhcp_dns($iface);
+        if (@dhcp_dns) {
+            print "DHCP DNS:    " . $self->label_dns_list(@dhcp_dns) . "\n\n";
+        }
+
+        print "SUGGESTED FIXES:\n";
+        print "1. Open a browser and try: http://neverssl.com\n";
+        print "   This often triggers the captive portal login page.\n\n";
+        print "2. If that doesn't work, try renewing your DHCP lease:\n";
+        print "   sudo ipconfig set $iface DHCP\n\n";
+        print "3. Some networks require you to disconnect and reconnect to WiFi.\n";
+
+        # Offer portal mode if we can modify DNS
+        if ($service) {
+            my @manual_dns = $self->get_manual_dns();
+            my @sys_dns = $self->get_dns_servers();
+            my $vpn_dns = $self->check_vpn_dns(@sys_dns);
+
+            if (@manual_dns || $vpn_dns) {
+                print "\n" . ("-" x 50) . "\n";
+                print "       QUICK FIX\n";
+                print +("-" x 50) . "\n";
+                if (@manual_dns) {
+                    print "You have manual DNS configured: " . $self->label_dns_list(@manual_dns) . "\n";
+                }
+                if ($vpn_dns) {
+                    print "You have $vpn_dns DNS active.\n";
+                }
+                print "This may prevent the captive portal from working.\n\n";
+                print "Enter portal mode to temporarily use network DNS? [y/N] ";
+
+                my $answer = <STDIN>;
+                chomp($answer) if defined $answer;
+                if (defined $answer && $answer =~ /^[Yy]/) {
+                    $self->run_portal_mode($iface, $gw);
+                }
+            }
+        }
+
+        print "\n";
         return;
     }
 
@@ -813,7 +930,7 @@ sub run {
         print "Network Info:\n";
         print "  Interface:   $iface\n";
         print "  Local IP:    $ip\n";
-        print "  Gateway:     $gw\n";
+        print "  Gateway:     " . ($gw // "(none)") . "\n";
         print "  Manual DNS:  " . (@manual_dns ? $self->label_dns_list(@manual_dns) : "(none)") . "\n";
         print "  DHCP DNS:    " . (@dhcp_dns ? $self->label_dns_list(@dhcp_dns) : "(none)") . "\n";
         print "  Actual DNS:  " . $self->label_dns_list(@sys_dns) . "\n";
@@ -824,7 +941,7 @@ sub run {
     # Q1: DNS or HTTP Interception?
     if ($dns_interception) {
         print "TYPE: DNS Interception\n";
-        print "The network is spoofing DNS records to point you to their local server ($gw).\n";
+        print "The network is spoofing DNS records to point you to their local server" . ($gw ? " ($gw)" : "") . ".\n";
     } elsif ($http_interception) {
         print "TYPE: HTTP Interception\n";
         print "DNS is real, but the gateway is intercepting HTTP traffic on port 80.\n";
