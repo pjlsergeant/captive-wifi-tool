@@ -7,6 +7,13 @@ Dependency-free script for trying to diagnose and fix why you can't connect to t
 
 and follow the instructions.
 
+## Options
+
+| Flag | Description |
+|------|-------------|
+| `-v` | Verbose mode - show commands being run |
+| `-t N` | Set HTTP timeout to N seconds (default: 2). Use `-t 10` on slow networks |
+
 # What it does
 
 Tries to figure out why you aren't connected to the internet. If you have DNS servers that are set to something that isn't DHCP, it'll offer to temporarily set your DNS to the DHCP server's one, fire up the portal, and then restore afterwards.
@@ -29,8 +36,14 @@ flowchart TD
 
     subgraph Network Discovery
         F --> G[Find default route<br/>interface + gateway]
-        G --> H[Validate sudo]
-        H -->|Failed| X1[Exit]
+        G --> GA{Default route found?}
+        GA -->|Yes| H[Validate sudo]
+        GA -->|No| GB[Check for active Wi-Fi interface]
+        GB --> GC{Wi-Fi active?}
+        GC -->|No| X1[Exit]
+        GC -->|Yes| GD[Limited diagnostics<br/>Wi-Fi active, no route]
+        GD --> END
+        H -->|Failed| X1
         H -->|OK| I[Get network service name]
         I --> J[Get DHCP lease<br/>IP + netmask]
         J --> K{Valid IP?}
